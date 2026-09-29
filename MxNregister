@@ -1,0 +1,198 @@
+// ARMv8-style register file: 32 registers x 64 bits, 2 read ports, 1 write port.
+// Register 31 is XZR: always reads 0, writes to it are dropped.
+module RegisterFile(
+    output wire [63:0] BusA,
+    output wire [63:0] BusB,
+    input  wire [63:0] BusW,
+    input  wire [4:0]  RA,
+    input  wire [4:0]  RB,
+    input  wire [4:0]  RW,
+    input  wire        RegWr,
+    input  wire        Clk
+);
+
+    // Storage: 32 x 64-bit. (Entry 31 is never written, and is never read.)
+    reg [63:0] registers [0:31];
+
+    // Values produced by the combinational read logic
+    reg [63:0] readA, readB;
+
+    // ---------------- Read ports (combinational, blocking) ----------------
+    // Reading XZR (register 31) gives 0 no matter what is in storage.
+    always @(*) begin
+        if (RA == 5'd31)
+            readA = 64'd0;
+        else
+            readA = registers[RA];
+
+        if (RB == 5'd31)
+            readB = 64'd0;
+        else
+            readB = registers[RB];
+    end
+
+    // #3 delay on the outputs (ignored by synthesis; avoids shoot-through in simulation)
+    assign #3 BusA = readA;
+    assign #3 BusB = readB;
+
+    // ---------------- Write port (sequential, non-blocking) ----------------
+    // Write on the rising clock edge only if enabled, and drop writes to XZR.
+    always @(posedge Clk) begin
+        if (RegWr && (RW != 5'd31))
+            registers[RW] <= BusW;
+    end
+
+endmodule
+
+ 
+Question 7
+Not yet graded / 30 pts
+Write a self-checking testbench for your registerfile. 
+
+Since the inputs and state elements are too many to exhaustively test, we will use a limited random testing strategy. 
+
+Thus, your test bench should test writing a random value and subsequently reading that random value back (and testing it for correctness) for each register with the write enable first on and then off.
+
+Be sure to also check that writes to register 31 are ignored and reads of 31 are always 0.
+
+Copy your testbench code below.
+
+When testing with the write enable off, the current random register value will not be written, how can you determine the expected output of reads that follow writes with the write enable off?
+
+Your Answer:
+`timescale 1ns / 1ps
+
+// Self-checking, limited-random testbench for RegisterFile (no ports)
+module RegisterFile_tb;
+
+    // DUT connections
+    reg  [63:0] BusW;
+    reg  [4:0]  RA, RB, RW;
+    reg         RegWr, Clk;
+    wire [63:0] BusA, BusB;
+
+    // Reference model: what every register SHOULD contain right now.
+    reg  [63:0] shadow [0:31];
+
+    reg  [63:0] rand_val;
+    integer     seed;
+    integer     i;
+    integer     errors;
+
+    RegisterFile dut (
+        .BusA  (BusA),
+        .BusB  (BusB),
+        .BusW  (BusW),
+        .RA    (RA),
+        .RB    (RB),
+        .RW    (RW),
+        .RegWr (RegWr),
+        .Clk   (Clk)
+    );
+
+    // 20 ns clock: rising edges at 10, 30, 50, ...
+    initial Clk = 1'b0;
+    always #10 Clk = ~Clk;
+
+    // VCD dump
+    initial begin
+        $dumpfile("RegisterFile.vcd");
+        $dumpvars(0, RegisterFile_tb);
+    end
+
+    // Expected value of a read: register 31 is always 0, else the reference model.
+    function [63:0] model_read;
+        input [4:0] r;
+        begin
+            if (r == 5'd31)
+                model_read = 64'd0;
+            else
+                model_read = shadow[r];
+        end
+    endfunction
+
+    // 64 random bits (never all-zero, so a dropped write to XZR is detectable)
+    task next_rand;
+        begin
+            rand_val = {$random(seed), $random(seed)};
+            if (rand_val == 64'd0)
+                rand_val = 64'd1;
+        end
+    endtask
+
+    // One clock cycle: drive inputs, let the clock edge happen, update the
+    // reference model, wait for the DUT's #3 output delay, then compare.
+    task cycle;
+        input [4:0]  wr_reg;
+        input [63:0] wr_val;
+        input        wr_en;
+        input [4:0]  ra_idx;
+        input [4:0]  rb_idx;
+        reg   [63:0] expA, expB;
+        begin
+            RW = wr_reg;  BusW = wr_val;  RegWr = wr_en;
+            RA = ra_idx;  RB   = rb_idx;
+
+            @(posedge Clk);
+
+            // Reference model does exactly what a correct register file would:
+            // write only if enabled AND target is not register 31.
+            if (wr_en && (wr_reg != 5'd31))
+                shadow[wr_reg] = wr_val;
+
+            #5;   // > 3 ns output delay
+
+            expA = model_read(ra_idx);
+            expB = model_read(rb_idx);
+
+            $display("t=%0t WE=%b W[%0d]<=%h | A[%0d]=%h (exp %h) | B[%0d]=%h (exp %h)",
+                     $time, wr_en, wr_reg, wr_val, ra_idx, BusA, expA, rb_idx, BusB, expB);
+
+            if (BusA !== expA) begin
+                errors = errors + 1;
+                $display("  *** ERROR on BusA: got %h expected %h", BusA, expA);
+            end
+            if (BusB !== expB) begin
+                errors = errors + 1;
+                $display("  *** ERROR on BusB: got %h expected %h", BusB, expB);
+            end
+        end
+    endtask
+
+    initial begin
+        errors = 0;
+        seed   = 32'h1234ABCD;   // fixed seed -> repeatable run
+
+        // ---- Phase 1: write enable ON. Write a random value to every register
+        //      (0..31) and read it back on both ports. Register 31 must read 0.
+        $display("--- Phase 1: RegWr = 1, write + read back each register ---");
+        for (i = 0; i < 32; i = i + 1) begin
+            next_rand;
+            cycle(i[4:0], rand_val, 1'b1, i[4:0], i[4:0]);
+        end
+
+        // ---- Phase 2: write enable OFF. Try to write a new random value to every
+        //      register; reads must still return the OLD value (0 for register 31).
+        $display("--- Phase 2: RegWr = 0, writes must be ignored ---");
+        for (i = 0; i < 32; i = i + 1) begin
+            next_rand;
+            cycle(i[4:0], rand_val, 1'b0, i[4:0], i[4:0]);
+        end
+
+        // ---- Phase 3: random mix of register, data, write enable and read ports
+        //      (different registers on A and B; register 31 gets hit sometimes).
+        $display("--- Phase 3: random cycles ---");
+        for (i = 0; i < 200; i = i + 1) begin
+            next_rand;
+            cycle($random(seed), rand_val, $random(seed), $random(seed), $random(seed));
+        end
+
+        if (errors == 0)
+            $display("PASS: register file behaved correctly.");
+        else
+            $display("FAIL: %0d mismatches.", errors);
+
+        $finish;
+    end
+
+endmodule
